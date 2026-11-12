@@ -3,7 +3,7 @@
 VoltLab Pro — Simulador educativo de circuitos AC adaptado para Streamlit.
 
 Para ejecutar localmente:
-    1. Instalar dependencias: pip install streamlit numpy matplotlib
+    1. Instalar dependencias: pip install streamlit numpy matplotlib requests
     2. Ejecutar: streamlit run VoltLab_Pro_Plus_Unidades_Graficas.py
 """
 
@@ -11,6 +11,8 @@ import io
 import math
 import cmath
 import re
+import json
+import base64
 import numpy as np
 import matplotlib.pyplot as plt
 import streamlit as st
@@ -353,6 +355,112 @@ def plot_time(r):
     )
     fig.tight_layout(rect=[0, 0, 1, 0.96], h_pad=2.2, w_pad=1.8)
     return fig
+
+
+
+def analyze_circuit_image_with_vision(image_bytes, api_key, model="gpt-4o-mini", image_mime="image/jpeg"):
+    """
+    Usa un modelo multimodal vía API para interpretar la foto y devolver
+    una matriz de mallas. Requiere clave API y conexión a Internet.
+    La salida se valida antes de resolverla.
+    """
+    try:
+        import requests
+    except ImportError as exc:
+        raise RuntimeError("Falta requests. Instala con: pip install requests") from exc
+
+    mime = image_mime if image_mime in ("image/jpeg", "image/png", "image/webp", "image/gif") else "image/jpeg"
+    b64 = base64.b64encode(image_bytes).decode("utf-8")
+    data_url = f"data:{mime};base64,{b64}"
+
+    schema_instruction = """
+Devuelve SOLO un objeto JSON válido, sin Markdown, con esta estructura:
+{
+  "circuit_type": "DC o AC",
+  "frequency_hz": 60,
+  "phase_reference": "explicación breve",
+  "components": [
+    {"id":"R1","type":"resistor","value":"10 ohm","branch":"rama compartida entre malla 1 y 2"}
+  ],
+  "mesh_count": 2,
+  "matrix": [["10+0j","-4+0j"],["-4+0j","12+0j"]],
+  "sources": ["12+0j","0+0j"],
+  "mesh_equations": ["...","..."],
+  "assumptions": ["..."],
+  "uncertain_items": ["..."]
+}
+REGLAS:
+- Inspecciona la imagen completa: símbolos, valores, nodos, polaridades, fuentes y conexiones.
+- No inventes valores ilegibles. Si no puedes leer un dato, indícalo en uncertain_items
+  y usa el texto "DATO_DESCONOCIDO" en components; no calcules una matriz ficticia.
+- Usa impedancias complejas en AC: R, jωL y 1/(jωC). Para DC en estado estacionario,
+  el inductor es cortocircuito y el capacitor circuito abierto; si el problema es transitorio,
+  no lo fuerces a un análisis fasorial.
+- Define todas las corrientes de malla en sentido horario. La matriz debe ser cuadrada.
+  Diagonal: suma de impedancias de la malla. Fuera de diagonal: negativo de impedancias
+  compartidas. Fuentes según polaridad y recorrido horario.
+- Si el dibujo no es un circuito planar, no hay suficiente información o la topología
+  no se puede determinar, explica el problema en uncertain_items y no inventes matriz.
+- Los valores de matrix y sources deben ser cadenas compatibles con Python complex(),
+  por ejemplo "4+3j", "-2j", "12+0j".
+- Para fuente sinusoidal, expresa fuentes como fasores RMS rectangulares, salvo que el
+  enunciado indique explícitamente amplitud pico; documenta la convención.
+- Devuelve solo el JSON.
+"""
+    payload = {
+        "model": model,
+        "temperature": 0,
+        "messages": [
+            {
+                "role": "system",
+                "content": "Eres un ingeniero electricista experto en análisis de circuitos. "
+                           "Interpreta imágenes con rigor y no inventes datos."
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": schema_instruction},
+                    {"type": "image_url", "image_url": {"url": data_url, "detail": "high"}}
+                ]
+            }
+        ]
+    }
+    response = requests.post(
+        "https://api.openai.com/v1/chat/completions",
+        headers={"Authorization": f"Bearer {api_key}",
+                 "Content-Type": "application/json"},
+        json=payload,
+        timeout=120
+    )
+    if response.status_code != 200:
+        try:
+            detail = response.json().get("error", {}).get("message", response.text)
+        except Exception:
+            detail = response.text
+        raise RuntimeError(f"Error de API ({response.status_code}): {detail}")
+
+    content = response.json()["choices"][0]["message"]["content"]
+    content = re.sub(r"^```(?:json)?\s*|\s*```$", "", content.strip(), flags=re.I)
+    try:
+        result = json.loads(content)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("El modelo no devolvió JSON válido. Intenta con una foto más nítida.") from exc
+
+    if result.get("uncertain_items"):
+        # Se devuelve la extracción para que el usuario pueda revisar los datos,
+        # pero no se ejecuta automáticamente una matriz si hay valores/topología dudosos.
+        result["_requires_review"] = True
+    return result
+
+
+def mesh_data_to_text(result):
+    matrix = result.get("matrix", [])
+    sources = result.get("sources", [])
+    if not matrix or len(matrix) != len(sources):
+        raise ValueError("La IA no generó una matriz cuadrada y un vector de fuentes compatibles.")
+    matrix_text = "\n".join(", ".join(str(v) for v in row) for row in matrix)
+    source_text = ", ".join(str(v) for v in sources)
+    return matrix_text, source_text
 
 
 def solve_mesh_system(matrix_text, source_text):
@@ -737,83 +845,160 @@ try:
         )
 
 
+
     with tab6:
-        st.subheader("Resolución de circuitos por el método de mallas")
-        st.info(
-            "Sube una fotografía del ejercicio para tenerla como referencia. "
-            "Después transcribe las ecuaciones de malla en forma matricial. "
-            "La fotografía no se convierte automáticamente en un circuito: "
-            "debes verificar conexiones, polaridades y valores."
+        st.subheader("📷 Análisis automático de circuitos desde una fotografía")
+        st.warning(
+            "La interpretación automática utiliza un modelo de visión mediante API. "
+            "La imagen se envía al servicio para analizarla. Revisa siempre los valores, "
+            "polaridades y conexiones detectados antes de usar los resultados."
         )
         uploaded = st.file_uploader(
-            "📷 Subir fotografía del circuito o ejercicio",
+            "Sube una fotografía clara del circuito o del ejercicio",
             type=["png", "jpg", "jpeg", "webp"],
             key="mesh_exercise_image"
         )
         if uploaded is not None:
-            st.image(uploaded, caption="Imagen del ejercicio cargada", use_container_width=True)
+            st.image(uploaded, caption="Fotografía cargada", use_container_width=True)
 
-        st.markdown("#### 1. Construye el sistema de ecuaciones")
-        st.latex(r"[Z][I]=[V]")
-        st.write(
-            "En cada fila escribe una ecuación de malla. La diagonal contiene "
-            "la suma de impedancias de esa malla; los términos fuera de la "
-            "diagonal son las impedancias compartidas con signo negativo "
-            "(si todas las corrientes de malla tienen el mismo sentido)."
+        st.markdown("#### Configuración del análisis visual")
+        api_key = st.text_input(
+            "Clave API de OpenAI",
+            type="password",
+            help="Se utiliza solo durante esta sesión. No la escribas en el código ni la compartas."
         )
-        default_matrix = "4+75.4j"
-        default_sources = "10-17.3205j"
-        matrix_text = st.text_area(
-            "Matriz de impedancias Z (por defecto: circuito RL de la imagen)",
-            value=default_matrix, height=100, key="mesh_matrix"
-        )
-        source_text = st.text_input(
-            "Vector de fuentes V (por defecto: fuente de 20∠−60° V)",
-            value=default_sources, key="mesh_sources"
-        )
+        model_name = st.text_input("Modelo de visión", value="gpt-4o-mini")
         st.caption(
-            "Admite números complejos en formato Python: 4, -j6, 3+4j. "
-            "Ejemplo: matriz 2×2 y vector con dos fuentes."
+            "Necesitas una clave API con acceso a un modelo que admita imágenes, "
+            "conexión a Internet y saldo/crédito disponible."
         )
-        if st.button("⚡ Resolver sistema de mallas", type="primary", key="solve_mesh"):
+
+        if st.button("🔍 Analizar foto y resolver por mallas", type="primary",
+                     disabled=(uploaded is None or not api_key.strip()),
+                     key="analyze_photo_mesh"):
             try:
-                A, b, mesh_i, residual = solve_mesh_system(matrix_text, source_text)
-                st.success(f"Sistema resuelto: {len(mesh_i)} mallas.")
-                cols = st.columns(min(len(mesh_i), 3))
-                for idx, current in enumerate(mesh_i):
-                    cols[idx % len(cols)].metric(
-                        f"Corriente I{idx+1}",
-                        f"{abs(current):.5g} A",
-                        f"Ángulo {math.degrees(cmath.phase(current)):.3f}°"
+                with st.spinner("Identificando componentes, conexiones y mallas..."):
+                    detected = analyze_circuit_image_with_vision(
+                        uploaded.getvalue(), api_key.strip(), model_name.strip(), uploaded.type
                     )
-                st.markdown("#### Desarrollo matricial")
-                st.code(
-                    "Matriz Z:\n" + np.array2string(A, precision=5) +
-                    "\n\nVector V:\n" + np.array2string(b, precision=5) +
-                    "\n\nCorrientes de malla:\n" + np.array2string(mesh_i, precision=7) +
-                    "\n\nComprobación Z·I − V:\n" + np.array2string(residual, precision=3),
-                    language="text"
-                )
-                st.markdown("#### Diagrama de corrientes de malla")
-                fig_mesh, ax_mesh = plt.subplots(figsize=(8, 2.8), dpi=120)
-                ax_mesh.set_facecolor("#111c30")
-                fig_mesh.patch.set_facecolor("#0b1220")
-                ax_mesh.bar([f"Malla {i+1}" for i in range(len(mesh_i))],
-                            [abs(x) for x in mesh_i], color="#35d0ba")
-                ax_mesh.set_ylabel("|I| (A)", color="white")
-                ax_mesh.set_title("Magnitud de las corrientes de malla", color="white")
-                ax_mesh.tick_params(colors="white")
-                ax_mesh.grid(axis="y", alpha=.25)
-                st.pyplot(fig_mesh, use_container_width=True)
-            except Exception as mesh_error:
-                st.error(f"No se pudo resolver el sistema: {mesh_error}")
-        st.markdown("#### Ejemplo de interpretación")
-        st.code(
-            "Malla 1: (R1 + Rcomp) I1 − Rcomp I2 = V1\n"
-            "Malla 2: −Rcomp I1 + (R2 + Rcomp) I2 = V2\n"
-            "Para AC, reemplaza R por impedancias complejas Z.",
-            language="text"
-        )
+                st.session_state["vlp_detected_circuit"] = detected
+                st.success("Análisis de imagen completado. Revisa los datos identificados.")
+            except Exception as vision_error:
+                st.error(f"No se pudo analizar la fotografía: {vision_error}")
+
+        detected = st.session_state.get("vlp_detected_circuit")
+        if detected:
+            st.markdown("---")
+            st.markdown("### 1. Componentes y características detectadas")
+            st.write(f"**Tipo de circuito:** {detected.get('circuit_type', 'No identificado')}")
+            if detected.get("frequency_hz") is not None:
+                st.write(f"**Frecuencia detectada:** {detected.get('frequency_hz')} Hz")
+            st.write(f"**Referencia de fase:** {detected.get('phase_reference', 'No especificada')}")
+
+            components = detected.get("components", [])
+            if components:
+                st.dataframe(components, use_container_width=True, hide_index=True)
+            for item in detected.get("assumptions", []):
+                st.info(f"Supuesto: {item}")
+            uncertain = detected.get("uncertain_items", [])
+            if uncertain:
+                st.error("Hay datos que requieren revisión:")
+                for item in uncertain:
+                    st.write(f"- {item}")
+
+            st.markdown("### 2. Ecuaciones de malla propuestas")
+            equations = detected.get("mesh_equations", [])
+            for idx, equation in enumerate(equations, 1):
+                st.write(f"**Malla {idx}:** {equation}")
+
+            try:
+                auto_matrix, auto_sources = mesh_data_to_text(detected)
+            except Exception as matrix_error:
+                st.error(f"No se puede construir el sistema automáticamente: {matrix_error}")
+                auto_matrix, auto_sources = "", ""
+
+            st.markdown("### 3. Revisión del sistema matricial")
+            st.caption(
+                "Puedes corregir los datos extraídos si la foto contiene valores poco legibles "
+                "o si la IA interpretó mal una conexión."
+            )
+            matrix_text = st.text_area(
+                "Matriz de impedancias [Z]",
+                value=auto_matrix, height=130, key="vlp_auto_matrix"
+            )
+            source_text = st.text_input(
+                "Vector de fuentes [V]",
+                value=auto_sources, key="vlp_auto_sources"
+            )
+            allow_solve = st.checkbox(
+                "Confirmo que los componentes, valores, conexiones y polaridades son correctos.",
+                value=False,
+                key="vlp_confirm_detected"
+            )
+
+            if st.button("🧮 Calcular corrientes de todas las mallas",
+                         type="primary", disabled=not allow_solve or not matrix_text.strip(),
+                         key="vlp_solve_detected"):
+                try:
+                    A, b, mesh_i, residual = solve_mesh_system(matrix_text, source_text)
+                    st.success(f"Resolución completada: {len(mesh_i)} malla(s).")
+                    metric_cols = st.columns(min(len(mesh_i), 4))
+                    for idx, current in enumerate(mesh_i):
+                        metric_cols[idx % len(metric_cols)].metric(
+                            f"Corriente I{idx+1}",
+                            f"{abs(current):.5g} A",
+                            f"{math.degrees(cmath.phase(current)):.3f}°"
+                        )
+
+                    st.markdown("#### Desarrollo matricial")
+                    st.latex(r"[Z][I]=[V]\quad\Rightarrow\quad[I]=[Z]^{-1}[V]")
+                    st.code(
+                        "Matriz Z:\n" + np.array2string(A, precision=6) +
+                        "\n\nVector V:\n" + np.array2string(b, precision=6) +
+                        "\n\nCorrientes de malla (A):\n" +
+                        "\n".join(
+                            f"I{idx+1} = {rectangular(current)} = {polar(current)} A"
+                            for idx, current in enumerate(mesh_i)
+                        ) +
+                        "\n\nComprobación Z·I − V:\n" +
+                        np.array2string(residual, precision=3),
+                        language="text"
+                    )
+
+                    st.markdown("#### Magnitud de las corrientes de malla")
+                    fig_mesh, ax_mesh = plt.subplots(figsize=(9, 3.5), dpi=130)
+                    fig_mesh.patch.set_facecolor("#0b1220")
+                    ax_mesh.set_facecolor("#111c30")
+                    bars = ax_mesh.bar(
+                        [f"Malla {idx+1}" for idx in range(len(mesh_i))],
+                        [abs(x) for x in mesh_i], color="#35d0ba"
+                    )
+                    ax_mesh.set_ylabel("|I| (A)", color="white")
+                    ax_mesh.set_title("Corrientes calculadas por el método de mallas",
+                                      color="white", fontweight="bold")
+                    ax_mesh.tick_params(colors="white")
+                    ax_mesh.grid(axis="y", alpha=.25)
+                    for bar, current in zip(bars, mesh_i):
+                        ax_mesh.text(
+                            bar.get_x() + bar.get_width()/2, bar.get_height(),
+                            f"{abs(current):.4g} A",
+                            ha="center", va="bottom", color="white", fontsize=9
+                        )
+                    st.pyplot(fig_mesh, use_container_width=True)
+                    st.caption(
+                        "La comprobación Z·I − V debe ser aproximadamente cero. "
+                        "Las corrientes de rama compartida se obtienen como diferencia "
+                        "algebraica de las corrientes de las mallas adyacentes."
+                    )
+                except Exception as solve_error:
+                    st.error(f"No se pudo resolver el sistema: {solve_error}")
+
+        else:
+            st.info(
+                "Carga una fotografía, introduce tu clave API y pulsa «Analizar foto». "
+                "El sistema intentará identificar resistencias, inductores, capacitores, "
+                "fuentes, valores, conexiones y número de mallas."
+            )
 
 except Exception as e:
     st.error(f"Error al simular: {e}")
